@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Kicki STT Test</title>
+  <style>
+    body { font-family: system-ui; max-width: 900px; margin: 24px auto; }
+    button { padding: 10px 14px; margin-right: 10px; }
+    pre { background: #f6f6f6; padding: 12px; border-radius: 10px; min-height: 120px; }
+  </style>
+</head>
+<body>
+  <h2>KickiBot — STT test (Deepgram)</h2>
+  <button id="start">Start mic</button>
+  <button id="stop">Stop</button>
+  <p><b>STT:</b> <span id="stt"></span></p>
+  <pre id="log"></pre>
+
+<script>
+const sttEl = document.getElementById("stt");
+const logEl = document.getElementById("log");
+let ws, audioCtx, processor, stream;
+
+function log(...a){ logEl.textContent += a.join(" ") + "\n"; }
+
+function downsampleTo16k(float32, inRate){
+  const outRate = 16000;
+  if (inRate === outRate) return float32;
+  const ratio = inRate / outRate;
+  const newLen = Math.round(float32.length / ratio);
+  const out = new Float32Array(newLen);
+  let offset = 0;
+  for (let i=0;i<newLen;i++){
+    const next = Math.round((i+1)*ratio);
+    let sum = 0, count = 0;
+    for (let j=offset;j<next && j<float32.length;j++){
+      sum += float32[j]; count++;
+    }
+    out[i] = count ? sum / count : 0;
+    offset = next;
+  }
+  return out;
+}
+
+function floatTo16BitPCM(f32){
+  const buf = new ArrayBuffer(f32.length * 2);
+  const view = new DataView(buf);
+  for (let i=0;i<f32.length;i++){
+    let s = Math.max(-1, Math.min(1, f32[i]));
+    view.setInt16(i*2, s < 0 ? s*0x8000 : s*0x7fff, true);
+  }
+  return buf;
+}
+
+async function start(){
+  ws = new WebSocket("ws://localhost:3001/ws");
+  ws.binaryType = "arraybuffer";
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string"){
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "stt_partial") sttEl.textContent = msg.text;
+      if (msg.type === "stt_final") { sttEl.textContent = msg.text; log("FINAL:", msg.text); }
+      if (msg.type === "session") log("SESSION:", msg.sessionId);
+      return;
+    }
+  };
+
+  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioCtx.createMediaStreamSource(stream);
+
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== 1) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const ds = downsampleTo16k(input, audioCtx.sampleRate);
+    const pcm = floatTo16BitPCM(ds);
+    ws.send(pcm);
+  };
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+  log("Mic started");
+}
+
+async function stop(){
+  try { processor?.disconnect(); } catch {}
+  try { audioCtx?.close(); } catch {}
+  try { stream?.getTracks()?.forEach(t=>t.stop()); } catch {}
+  try { ws?.close(); } catch {}
+  log("Stopped");
+}
+
+document.getElementById("start").onclick = start;
+document.getElementById("stop").onclick = stop;
+</script>
+</body>
+</html>

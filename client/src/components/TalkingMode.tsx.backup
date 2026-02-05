@@ -1,0 +1,530 @@
+import { useState, useEffect, useRef } from "react";
+import { Button } from "@/components/ui/button";
+import { Mic, MicOff, X, Volume2, VolumeX, AlertCircle, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { motion, AnimatePresence } from "framer-motion";
+
+type KickiVisualState = "idle" | "speaking" | "empathy";
+type KickiLang = "es" | "en";
+
+interface TalkingModeProps {
+  onClose: () => void;
+}
+
+/**
+ * Configurable por .env (Vite):
+ * VITE_VOICE_WS_URL=ws://localhost:3001/ws
+ * o wss://xxxxx.ngrok-free.dev/ws
+ */
+const VOICE_WS_URL =
+  ((import.meta as any).env?.VITE_VOICE_WS_URL as string | undefined) ||
+  "ws://localhost:3001/ws";
+
+// Audio helpers (PCM 16-bit, 16kHz mono)
+function downsampleTo16k(float32: Float32Array, inRate: number) {
+  const outRate = 16000;
+  if (inRate === outRate) return float32;
+  const ratio = inRate / outRate;
+  const newLen = Math.round(float32.length / ratio);
+  const out = new Float32Array(newLen);
+  let offset = 0;
+
+  for (let i = 0; i < newLen; i++) {
+    const next = Math.round((i + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+    for (let j = offset; j < next && j < float32.length; j++) {
+      sum += float32[j];
+      count++;
+    }
+    out[i] = count ? sum / count : 0;
+    offset = next;
+  }
+  return out;
+}
+
+function floatTo16BitPCM(f32: Float32Array) {
+  const buf = new ArrayBuffer(f32.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buf;
+}
+
+export default function TalkingMode({ onClose }: TalkingModeProps) {
+  const [visualState, setVisualState] = useState<KickiVisualState>("idle");
+  const [isListening, setIsListening] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [lastBotMessage, setLastBotMessage] = useState<string>(
+    "Hola, soy Kicki. Pulsa el micrófono y dime cómo puedo ayudarte."
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [isThinking, setIsThinking] = useState(false);
+  const [lang, setLang] = useState<KickiLang>("es");
+
+  // Para evitar bloqueo de autoplay
+  const userInteractedRef = useRef(false);
+
+  // Audio playback (TTS desde backend /api/tts)
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
+
+  // Voice WS + mic pipeline
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const wsPingTimerRef = useRef<number | null>(null);
+
+  const stopAudio = () => {
+    try {
+      const a = audioRef.current;
+      if (a) {
+        a.pause();
+        a.currentTime = 0;
+      }
+    } catch {}
+    audioRef.current = null;
+
+    if (audioUrlRef.current) {
+      try {
+        URL.revokeObjectURL(audioUrlRef.current);
+      } catch {}
+      audioUrlRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      stopAudio();
+      stopWsListening().catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const speak = async (text: string, empathy = false) => {
+    const safeText = (text || "").trim();
+    if (!safeText) return;
+
+    // IMPORTANTE: sin interacción del usuario, el navegador puede bloquear el audio
+    if (!userInteractedRef.current) {
+      setLastBotMessage(safeText);
+      return;
+    }
+
+    if (isMuted) {
+      setLastBotMessage(safeText);
+      return;
+    }
+
+    try {
+      // corta audio previo (si existe)
+      stopAudio();
+
+      setVisualState(empathy ? "empathy" : "speaking");
+      setLastBotMessage(safeText);
+      setError(null);
+
+      const resp = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: safeText, lang }),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        throw new Error(`TTS error (${resp.status}): ${errText.slice(0, 200)}`);
+      }
+
+      const wavBlob = await resp.blob();
+      const url = URL.createObjectURL(wavBlob);
+      audioUrlRef.current = url;
+
+      const audio = new Audio(url);
+      audioRef.current = audio;
+
+      audio.onended = () => {
+        stopAudio();
+        setVisualState("idle");
+      };
+
+      audio.onerror = () => {
+        stopAudio();
+        setVisualState("idle");
+        setLastBotMessage(safeText);
+      };
+
+      await audio.play();
+    } catch (e) {
+      console.error("Error in speak():", e);
+      stopAudio();
+      setVisualState("idle");
+      setLastBotMessage(safeText);
+    }
+  };
+
+  // Llama a TU backend (Node) que a su vez llama a Manus
+  const callManus = async (input: string) => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 60000);
+
+    try {
+      const resp = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: input }),
+        signal: controller.signal,
+      });
+
+      const data = await resp.json().catch(() => ({} as any));
+      if (!resp.ok) {
+        const msg =
+          data?.error?.message ||
+          (typeof data?.error === "string" ? data.error : null) ||
+          `Error /api/chat (${resp.status})`;
+        throw new Error(msg);
+      }
+
+      const reply =
+        (typeof data?.reply === "string" && data.reply) ||
+        (typeof data?.text === "string" && data.text) ||
+        (typeof data?.message === "string" && data.message) ||
+        (typeof data?.answer === "string" && data.answer) ||
+        "";
+
+      return reply.trim();
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  };
+
+  const clearWsPing = () => {
+    if (wsPingTimerRef.current) {
+      window.clearInterval(wsPingTimerRef.current);
+      wsPingTimerRef.current = null;
+    }
+  };
+
+  const stopWsListening = async () => {
+    clearWsPing();
+
+    try {
+      processorRef.current?.disconnect();
+    } catch {}
+    try {
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        await audioCtxRef.current.close();
+      }
+    } catch {}
+    try {
+      streamRef.current?.getTracks()?.forEach((t) => t.stop());
+    } catch {}
+    try {
+      wsRef.current?.close();
+    } catch {}
+
+    processorRef.current = null;
+    audioCtxRef.current = null;
+    streamRef.current = null;
+    wsRef.current = null;
+
+    setIsListening(false);
+  };
+
+  const startWsListening = async () => {
+    setTranscript("");
+    setError(null);
+
+    // Barge-in: corta TTS si estaba hablando
+    stopAudio();
+    setVisualState("idle");
+
+    // 1) WebSocket (STT)
+    console.log("VOICE_WS_URL =>", VOICE_WS_URL);
+    const ws = new WebSocket(VOICE_WS_URL);
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    const startPing = () => {
+      clearWsPing();
+      wsPingTimerRef.current = window.setInterval(() => {
+        try {
+          if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send("ping");
+        } catch {}
+      }, 15000);
+    };
+
+    ws.onopen = () => {
+      startPing();
+      try {
+        ws.send(JSON.stringify({ type: "barge_in" }));
+      } catch {}
+    };
+
+    ws.onmessage = async (ev) => {
+      if (typeof ev.data !== "string") return;
+
+      let msg: any = null;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+
+      if (msg.type === "stt_partial") {
+        setTranscript(msg.text || "");
+        return;
+      }
+
+      if (msg.type === "stt_final") {
+        const finalText = (msg.text || "").trim();
+        if (!finalText) return;
+
+        setTranscript(finalText);
+        await stopWsListening();
+
+        // 2) Llama a Manus (backend)
+        setIsThinking(true);
+        try {
+         const reply = await callManus(finalText);
+const safeReply = reply || "No pude generar respuesta. ¿Puedes repetirlo de otra forma?";
+setLastBotMessage(safeReply);
+setVisualState("idle");
+// await speak(safeReply);  // TTS desactivado temporalmente
+        } catch (e: any) {
+          console.error(e);
+          setError(e?.message || "Error hablando con Manus.");
+          // await speak("Tuve un problema conectando con el servidor. Inténtalo otra vez.");
+setLastBotMessage("Tuve un problema conectando con el servidor. Inténtalo otra vez.");
+        } finally {
+          setIsThinking(false);
+          setTranscript("");
+        }
+        return;
+      }
+
+      if (msg.type === "error") {
+        setError(msg.message || "Error del servidor de voz.");
+        return;
+      }
+    };
+
+   ws.onerror = () => {
+  setError(`Error de conexión de voz (WebSocket). URL=${VOICE_WS_URL}`);
+  stopWsListening().catch(() => {});
+};
+
+
+    ws.onclose = () => {
+      clearWsPing();
+      setIsListening(false);
+    };
+
+    // 2) Micrófono + WebAudio
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    streamRef.current = stream;
+
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    audioCtxRef.current = audioCtx;
+
+    const source = audioCtx.createMediaStreamSource(stream);
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processorRef.current = processor;
+
+    processor.onaudioprocess = (e) => {
+      const currentWs = wsRef.current;
+      if (!currentWs || currentWs.readyState !== WebSocket.OPEN) return;
+
+      const input = e.inputBuffer.getChannelData(0);
+      const ds = downsampleTo16k(input, audioCtx.sampleRate);
+      const pcm = floatTo16BitPCM(ds);
+      currentWs.send(pcm);
+    };
+
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    setIsListening(true);
+  };
+
+  const toggleListening = async () => {
+    // Marca interacción para permitir TTS
+    userInteractedRef.current = true;
+
+    try {
+      if (isListening) {
+        await stopWsListening();
+      } else {
+        await startWsListening();
+      }
+    } catch (e) {
+      console.error("Error toggling listening:", e);
+      setError("Error al activar el micrófono.");
+      setIsListening(false);
+    }
+  };
+
+  const toggleMute = () => {
+    userInteractedRef.current = true;
+    setIsMuted((m) => !m);
+
+    // Si acabas de mutear, corta audio
+    if (!isMuted) {
+      stopAudio();
+      setVisualState("idle");
+    }
+  };
+
+  // Assets mapping
+  const assets: Record<KickiVisualState, string> = {
+    idle: "/assets/kicki_fullbody_idle.mp4",
+    speaking: "/assets/kicki_fullbody_talk.mp4",
+    empathy: "/assets/kicki_fullbody_empathy.mp4",
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black flex flex-col items-center justify-center overflow-hidden">
+      {/* Background / Video Player */}
+      <div className="absolute inset-0 z-0">
+        <AnimatePresence mode="wait">
+          <motion.video
+            key={visualState}
+            src={assets[visualState]}
+            autoPlay
+            loop
+            muted
+            playsInline
+            initial={{ opacity: 0.8, scale: 1.05 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0.8 }}
+            transition={{ duration: 0.5 }}
+            className="w-full h-full object-cover opacity-90"
+            onError={() => console.error("Video load error")}
+          />
+        </AnimatePresence>
+        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20" />
+      </div>
+
+      {/* Top Controls */}
+      <div className="absolute top-4 right-4 sm:top-6 sm:right-6 z-50 flex gap-2 sm:gap-4">
+        {/* Language toggle */}
+        <div className="flex rounded-full bg-black/20 backdrop-blur-md border border-white/10 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setLang("es")}
+            className={cn(
+              "px-3 py-2 text-xs sm:text-sm text-white/90 hover:bg-white/10",
+              lang === "es" && "bg-white/15"
+            )}
+          >
+            ES
+          </button>
+          <button
+            type="button"
+            onClick={() => setLang("en")}
+            className={cn(
+              "px-3 py-2 text-xs sm:text-sm text-white/90 hover:bg-white/10",
+              lang === "en" && "bg-white/15"
+            )}
+          >
+            EN
+          </button>
+        </div>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={toggleMute}
+          className="rounded-full bg-black/20 backdrop-blur-md border border-white/10 text-white hover:bg-white/20 w-10 h-10 sm:w-12 sm:h-12"
+        >
+          {isMuted ? <VolumeX className="w-5 h-5 sm:w-6 sm:h-6" /> : <Volume2 className="w-5 h-5 sm:w-6 sm:h-6" />}
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => {
+            stopWsListening().catch(() => {});
+            stopAudio();
+            onClose();
+          }}
+          className="rounded-full bg-black/20 backdrop-blur-md border border-white/10 text-white hover:bg-white/20 w-10 h-10 sm:w-12 sm:h-12"
+        >
+          <X className="w-5 h-5 sm:w-6 sm:h-6" />
+        </Button>
+      </div>
+
+      {/* Bottom Interface */}
+      <div className="absolute bottom-0 left-0 right-0 p-4 sm:p-8 z-50 flex flex-col items-center gap-4 sm:gap-6">
+        {/* Error Message */}
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="flex items-center gap-2 bg-red-500/20 border border-red-500/50 text-white px-4 py-2 rounded-lg text-sm"
+          >
+            <AlertCircle className="w-4 h-4" />
+            {error}
+          </motion.div>
+        )}
+
+        {/* Captions / Transcript */}
+        <div className="w-full max-w-2xl text-center space-y-2 sm:space-y-4 min-h-[80px] sm:min-h-[120px] flex flex-col justify-end">
+          <motion.p
+            key={lastBotMessage}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="text-lg sm:text-2xl md:text-3xl font-serif font-medium text-white drop-shadow-lg"
+          >
+            "{lastBotMessage}"
+          </motion.p>
+
+          {transcript && (
+            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-sm sm:text-lg text-white/70 italic">
+              Tú: {transcript}
+            </motion.p>
+          )}
+
+          {isThinking && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-center">
+              <div className="flex items-center gap-2 text-white/70 text-sm">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Pensando...
+              </div>
+            </motion.div>
+          )}
+        </div>
+
+        {/* Mic Control */}
+        <div className="relative">
+          {isListening && <span className="absolute inset-0 rounded-full bg-primary/50 animate-ping" />}
+          <Button
+            size="lg"
+            onClick={toggleListening}
+            disabled={isThinking}
+            className={cn(
+              "relative w-16 h-16 sm:w-20 sm:h-20 rounded-full border-4 transition-all duration-300 shadow-2xl",
+              isListening
+                ? "bg-red-500 border-red-300 hover:bg-red-600"
+                : "bg-white/10 backdrop-blur-md border-white/50 hover:bg-white/20",
+              isThinking && "opacity-60 cursor-not-allowed"
+            )}
+          >
+            {isListening ? (
+              <MicOff className="w-6 h-6 sm:w-8 sm:h-8 text-white" />
+            ) : (
+              <Mic className="w-6 h-6 sm:w-8 sm:h-8 text-white" />
+            )}
+          </Button>
+        </div>
+
+        <p className="text-white/50 text-xs sm:text-sm font-medium tracking-widest uppercase">
+          {isThinking ? "Procesando..." : isListening ? "Escuchando..." : "Pulsa para hablar"}
+        </p>
+      </div>
+    </div>
+  );
+}

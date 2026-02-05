@@ -1,0 +1,301 @@
+import "dotenv/config";
+import express from "express";
+import { createServer } from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import WebSocket, { WebSocketServer } from "ws";
+import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import os from "node:os";
+import { promises as fs } from "node:fs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractReplyFromTask(task) {
+  if (!task) return "";
+
+  const msgs =
+    task?.messages ||
+    task?.outputMessages ||
+    task?.output?.messages ||
+    task?.task?.output?.messages ||
+    task?.task?.messages ||
+    task?.output ||
+    [];
+
+  if (Array.isArray(msgs)) {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      const content =
+        (typeof m?.content === "string" && m.content) ||
+        (typeof m?.text === "string" && m.text) ||
+        (typeof m === "string" && m) ||
+        "";
+
+      if (Array.isArray(m?.content)) {
+        for (const c of m.content) {
+          if (typeof c?.text === "string" && c.text.trim()) {
+            return c.text.trim();
+          }
+        }
+      }
+
+      if (content && content.trim()) return content.trim();
+    }
+  }
+
+  return "";
+}
+
+function deepgramConnect(onTranscript) {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) throw new Error("Missing DEEPGRAM_API_KEY in .env");
+
+  const url =
+    "wss://api.deepgram.com/v1/listen?model=nova-2&punctuate=true&interim_results=true&encoding=linear16&sample_rate=16000";
+
+  const dg = new WebSocket(url, {
+    headers: { Authorization: `Token ${key}` },
+  });
+
+  dg.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString("utf8"));
+      const alt = msg?.channel?.alternatives?.[0];
+      const transcript = alt?.transcript || "";
+      const isFinal = !!msg?.is_final;
+      if (transcript) onTranscript({ transcript, isFinal });
+    } catch {
+      // ignore
+    }
+  });
+
+  dg.on("error", (e) => {
+    console.error("Deepgram WS error:", e);
+  });
+
+  return dg;
+}
+
+async function startServer() {
+  const app = express();
+  const server = createServer(app);
+
+  app.use(express.json({ limit: "1mb" }));
+
+  app.get("/health", (_req, res) => res.json({ ok: true }));
+
+  app.post("/api/chat", async (req, res) => {
+    try {
+      const text = req.body?.text;
+      if (!text || typeof text !== "string") {
+        return res.status(400).json({ error: "Missing 'text' (string) in body" });
+      }
+
+      const apiKey = process.env.MANUS_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ error: "Missing MANUS_API_KEY in .env" });
+      }
+
+      const baseUrl = "https://api.manus.ai";
+
+      const createResp = await fetch(`${baseUrl}/v1/tasks`, {
+        method: "POST",
+        headers: {
+          API_KEY: apiKey,
+          "Content-Type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({ prompt: text }),
+      });
+
+      const createRaw = await createResp.text().catch(() => "");
+      const createData = safeJsonParse(createRaw) ?? {};
+
+      if (!createResp.ok) {
+        const errMsg =
+          (typeof createData?.error === "string" && createData.error) ||
+          createData?.error?.message ||
+          createRaw ||
+          `Manus create task failed (${createResp.status})`;
+        return res.status(createResp.status).json({ error: errMsg, data: createData });
+      }
+
+      const taskId =
+        createData?.id ??
+        createData?.task_id ??
+        createData?.taskId;
+
+      if (!taskId) {
+        return res.status(502).json({
+          error: "Manus: missing task id in create response",
+          data: createData,
+        });
+      }
+
+      const deadline = Date.now() + 60000;
+      let lastTask = null;
+
+      while (Date.now() < deadline) {
+        const getResp = await fetch(`${baseUrl}/v1/tasks/${taskId}`, {
+          method: "GET",
+          headers: { API_KEY: apiKey, accept: "application/json" },
+        });
+
+        const getRaw = await getResp.text().catch(() => "");
+        const taskData = safeJsonParse(getRaw) ?? {};
+
+        if (!getResp.ok) {
+          const errMsg =
+            (typeof taskData?.error === "string" && taskData.error) ||
+            taskData?.error?.message ||
+            getRaw ||
+            `Manus get task failed (${getResp.status})`;
+          return res.status(getResp.status).json({ error: errMsg, data: taskData });
+        }
+
+        lastTask = taskData;
+
+        const status =
+          taskData?.status ??
+          taskData?.state ??
+          taskData?.task?.status ??
+          taskData?.task?.state ??
+          "";
+
+        const s = String(status).toLowerCase();
+
+        if (
+          s.includes("complete") ||
+          s.includes("done") ||
+          s.includes("success") ||
+          s === "succeeded" ||
+          s === "completed"
+        ) {
+          break;
+        }
+
+        if (s.includes("fail") || s.includes("error")) {
+          return res.status(502).json({ error: "Manus task failed", task: taskData });
+        }
+
+        await sleep(1000);
+      }
+
+      if (!lastTask) return res.status(504).json({ error: "Manus timeout" });
+
+      const reply = extractReplyFromTask(lastTask).trim();
+      if (!reply) {
+        return res.json({ reply: "", note: "No reply extracted", task: lastTask });
+      }
+
+      return res.json({ reply });
+    } catch (err) {
+      console.error("POST /api/chat error:", err);
+      return res.status(500).json({ error: err?.message || "Internal error" });
+    }
+  });
+
+  const wss = new WebSocketServer({ server, path: "/ws" });
+
+  wss.on("connection", (ws) => {
+    console.log("✅ Client connected to WebSocket");
+
+    let dgWs = null;
+    let sessionId = crypto.randomUUID();
+
+    try {
+      dgWs = deepgramConnect(({ transcript, isFinal }) => {
+        console.log(`[${sessionId}] Transcript (final=${isFinal}):`, transcript);
+
+        try {
+          ws.send(JSON.stringify({
+            type: isFinal ? "stt_final" : "stt_partial",
+            text: transcript
+          }));
+        } catch (e) {
+          console.error("Error sending transcript to client:", e);
+        }
+      });
+
+      dgWs.on("open", () => {
+        console.log(`[${sessionId}] Deepgram connection opened`);
+      });
+
+      dgWs.on("close", () => {
+        console.log(`[${sessionId}] Deepgram connection closed`);
+      });
+
+      dgWs.on("error", (err) => {
+        console.error(`[${sessionId}] Deepgram error:`, err);
+      });
+    } catch (err) {
+      console.error("Failed to connect to Deepgram:", err);
+      ws.send(JSON.stringify({
+        type: "error",
+        message: "Failed to initialize speech recognition"
+      }));
+    }
+
+    ws.on("message", (data) => {
+      try {
+        if (Buffer.isBuffer(data)) {
+          if (dgWs && dgWs.readyState === WebSocket.OPEN) {
+            dgWs.send(data);
+          }
+        } else {
+          const msg = JSON.parse(data.toString());
+
+          if (msg.type === "start") {
+            console.log(`[${sessionId}] Client started recording`);
+          } else if (msg.type === "stop") {
+            console.log(`[${sessionId}] Client stopped recording`);
+            if (dgWs && dgWs.readyState === WebSocket.OPEN) {
+              dgWs.send(JSON.stringify({ type: "KeepAlive" }));
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Error processing WebSocket message:", err);
+      }
+    });
+
+    ws.on("close", () => {
+      console.log(`[${sessionId}] Client disconnected`);
+      if (dgWs) {
+        dgWs.close();
+      }
+    });
+
+    ws.on("error", (err) => {
+      console.error(`[${sessionId}] WebSocket error:`, err);
+    });
+
+    ws.send(JSON.stringify({
+      type: "ready",
+      sessionId
+    }));
+  });
+
+  const port = Number(process.env.PORT || "3001");
+
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${port}/`);
+    console.log(`WebSocket running on ws://localhost:${port}/ws`);
+  });
+}
+
+startServer().catch(console.error);
