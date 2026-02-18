@@ -11,7 +11,52 @@ app.use(express.json({ limit: "1mb" }));
 
 // Health check
 app.get("/health", (_req, res) => res.json({ ok: true }));
+// TTS endpoint - OpenAI
+app.post("/api/tts", async (req, res) => {
+  try {
+    const text = req.body?.text;
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "Missing 'text' in body" });
+    }
 
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+    }
+
+    console.log("🔊 TTS request:", text.substring(0, 50));
+
+    const response = await fetch("https://api.openai.com/v1/audio/speech", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "tts-1",
+        voice: "nova",
+        input: text,
+        speed: 1.0
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error("❌ OpenAI TTS failed:", error);
+      return res.status(response.status).json({ error });
+    }
+
+    const audioBuffer = await response.arrayBuffer();
+    console.log("✅ TTS generated:", audioBuffer.byteLength, "bytes");
+
+    res.set("Content-Type", "audio/mpeg");
+    res.send(Buffer.from(audioBuffer));
+
+  } catch (err) {
+    console.error("❌ /api/tts error:", err);
+    return res.status(500).json({ error: String(err) });
+  }
+});
 // Chat endpoint - OpenAI GPT-4
 app.post("/api/chat", async (req, res) => {
   console.log("📥 /api/chat called with:", req.body?.text?.substring(0, 50));
@@ -47,7 +92,7 @@ app.post("/api/chat", async (req, res) => {
             content: text
           }
         ],
-        max_tokens: 60,
+        max_tokens: 40,
         temperature: 0.7
       }),
     });
@@ -71,9 +116,13 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // TTS endpoint - OpenAI
-app.post("/api/tts", async (req, res) => {
+app.post("/api/chat", async (req, res) => {
+  console.log("📥 /api/chat called with:", req.body?.text?.substring(0, 50));
+
   try {
     const text = req.body?.text;
+    const lang = req.body?.lang || "es";
+    
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing 'text' in body" });
     }
@@ -83,36 +132,43 @@ app.post("/api/tts", async (req, res) => {
       return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
     }
 
-    console.log("🔊 TTS request:", text.substring(0, 50));
+    console.log("💬 Calling OpenAI in", lang);
 
-    const response = await fetch("https://api.openai.com/v1/audio/speech", {
+    const systemPrompt = lang === "es" 
+      ? "Eres Kicki, una asesora de belleza amigable y conocedora. Ayudas a las personas con cuidado de la piel, maquillaje y consejos de belleza. Mantén las respuestas breves (menos de 25 palabras) y conversacionales. Sé cálida, profesional y servicial. SIEMPRE responde en español."
+      : "You are Kicki, a friendly and knowledgeable beauty advisor. You help people with skincare, makeup, and beauty advice. Keep responses brief (under 25 words) and conversational. Be warm, professional, and helpful. ALWAYS respond in English.";
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "tts-1-hd",
-        voice: "shimmer", 
-        input: text,
-        speed: 1.0
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: text }
+        ],
+        max_tokens: 60,
+        temperature: 0.7
       }),
     });
 
     if (!response.ok) {
       const error = await response.text();
-      console.error("❌ OpenAI TTS failed:", error);
+      console.error("❌ OpenAI failed:", error);
       return res.status(response.status).json({ error });
     }
 
-    const audioBuffer = await response.arrayBuffer();
-    console.log("✅ TTS generated:", audioBuffer.byteLength, "bytes");
-    
-    res.set("Content-Type", "audio/mpeg");
-    res.send(Buffer.from(audioBuffer));
+    const data = await response.json();
+    const reply = data?.choices?.[0]?.message?.content?.trim() || "";
+
+    console.log("✅ Reply:", reply);
+    return res.json({ reply });
 
   } catch (err) {
-    console.error("❌ /api/tts error:", err);
+    console.error("❌ /api/chat error:", err);
     return res.status(500).json({ error: String(err) });
   }
 });
@@ -130,7 +186,8 @@ wss.on("connection", (ws) => {
     const key = process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error("Missing DEEPGRAM_API_KEY");
 
-    const url = "wss://api.deepgram.com/v1/listen?model=nova-2&punctuate=true&interim_results=true&encoding=linear16&sample_rate=16000&endpointing=500&utterance_end_ms=1500";
+    const url = "wss://api.deepgram.com/v1/listen?model=nova-2&detect_language=true&punctuate=true&interim_results=true&encoding=linear16&sample_rate=16000&endpointing=300&utterance_end_ms=1000";
+
     dgWs = new WebSocket(url, { headers: { Authorization: `Token ${key}` } });
 
     dgWs.on("open", () => {

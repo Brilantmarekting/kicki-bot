@@ -1,290 +1,343 @@
-import { useEffect, useRef, useState } from "react";
+import { useState, useEffect, useRef } from "react";
+import { Button } from "@/components/ui/button";
+import { Mic, MicOff, X, Volume2, VolumeX, AlertCircle, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { motion, AnimatePresence } from "framer-motion";
 
-type Message = {
-  role: "user" | "assistant";
-  content: string;
-};
+type KickiVisualState = "idle" | "speaking" | "empathy";
+type KickiLang = "es" | "en";
 
-export function TalkingMode() {
-  const [messages, setMessages] = useState<Message[]>([]);
+interface TalkingModeProps {
+  onClose: () => void;
+}
+
+const VOICE_WS_URL =
+  ((import.meta as any).env?.VITE_VOICE_WS_URL as string | undefined) ||
+  "ws://localhost:3001/ws";
+
+function downsampleTo16k(float32: Float32Array, inRate: number) {
+  const outRate = 16000;
+  if (inRate === outRate) return float32;
+  const ratio = inRate / outRate;
+  const newLen = Math.round(float32.length / ratio);
+  const out = new Float32Array(newLen);
+  let offset = 0;
+  for (let i = 0; i < newLen; i++) {
+    const next = Math.round((i + 1) * ratio);
+    let sum = 0, count = 0;
+    for (let j = offset; j < next && j < float32.length; j++) { sum += float32[j]; count++; }
+    out[i] = count ? sum / count : 0;
+    offset = next;
+  }
+  return out;
+}
+
+function floatTo16BitPCM(f32: Float32Array) {
+  const buf = new ArrayBuffer(f32.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buf;
+}
+
+export default function TalkingMode({ onClose }: TalkingModeProps) {
+  const [visualState, setVisualState] = useState<KickiVisualState>("idle");
   const [isListening, setIsListening] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [videoState, setVideoState] = useState<"idle" | "talk">("idle");
-  
+  const [isMuted, setIsMuted] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [lastBotMessage, setLastBotMessage] = useState<string>(
+    "Hola, soy Kicki. Pulsa el micrófono y dime cómo puedo ayudarte."
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [isThinking, setIsThinking] = useState(false);
+  const [lang, setLang] = useState<KickiLang>("es");
+
+  const userInteractedRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const wsPingTimerRef = useRef<number | null>(null);
 
-  const stopListening = () => {
-    console.log("🛑 Stopping...");
-    
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    
-    setIsListening(false);
-    setVideoState("idle");
-  };
-
-  const startListening = async () => {
-    console.log("▶️ Starting...");
-    
-    try {
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log("✅ Connected");
-        setVideoState("talk");
-      };
-
-      ws.onmessage = async (event) => {
-        const data = JSON.parse(event.data);
-        console.log("📩 Message:", data);
-
-        if (data.type === "stt_final" && data.text?.trim()) {
-          console.log("📝 You said:", data.text);
-          setMessages((prev) => [...prev, { role: "user", content: data.text }]);
-          setIsProcessing(true);
-
-          try {
-            const response = await fetch("/api/chat", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: data.text }),
-            });
-
-            const result = await response.json();
-            console.log("💬 Kicki says:", result.reply);
-
-            if (result.reply) {
-              setMessages((prev) => [
-                ...prev,
-                { role: "assistant", content: result.reply },
-              ]);
-            }
-          } catch (error) {
-            console.error("❌ Error:", error);
-          } finally {
-            setIsProcessing(false);
-          }
-        }
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const audioContext = new AudioContext({ sampleRate: 16000 });
-      audioContextRef.current = audioContext;
-
-      const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-
-      processor.onaudioprocess = (e) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          const inputData = e.inputBuffer.getChannelData(0);
-          const pcmData = new Int16Array(inputData.length);
-          for (let i = 0; i < inputData.length; i++) {
-            pcmData[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
-          }
-          ws.send(pcmData.buffer);
-        }
-      };
-
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      console.log("🎤 Listening...");
-      setIsListening(true);
-
-    } catch (error) {
-      console.error("❌ Failed:", error);
-      stopListening();
-    }
-  };
-
-  const handleClick = () => {
-    console.log("🖱️ Button clicked! isListening =", isListening);
-    
-    if (isListening) {
-      stopListening();
-    } else {
-      startListening();
-    }
+  const stopAudio = () => {
+    try { const a = audioRef.current; if (a) { a.pause(); a.currentTime = 0; } } catch {}
+    audioRef.current = null;
+    if (audioUrlRef.current) { try { URL.revokeObjectURL(audioUrlRef.current); } catch {} audioUrlRef.current = null; }
   };
 
   useEffect(() => {
-    return () => stopListening();
+    return () => { stopAudio(); stopWsListening().catch(() => {}); };
   }, []);
 
-  useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.src = `/videos/kicki_fullbody_${videoState}.mp4`;
-      videoRef.current.load();
-      videoRef.current.play().catch(console.error);
+  const speak = async (text: string, empathy = false) => {
+    const safeText = (text || "").trim();
+    if (!safeText) return;
+    if (isMuted) { setLastBotMessage(safeText); return; }
+    try {
+      stopAudio();
+      setVisualState(empathy ? "empathy" : "speaking");
+      setLastBotMessage(safeText);
+      setError(null);
+      console.log("🔊 Fetching TTS for:", safeText);
+      const resp = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: safeText, lang }),
+      });
+      if (!resp.ok) throw new Error(`TTS error (${resp.status})`);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      audioUrlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onloadedmetadata = () => console.log('📊 Audio duration:', audio.duration, 's');
+      audio.onplay = () => console.log('▶️ Audio started');
+      audio.onended = () => { console.log('✅ Audio ended'); stopAudio(); setVisualState("idle"); };
+      audio.onerror = (e) => { console.error("❌ Audio playback error:", e); stopAudio(); setVisualState("idle"); setLastBotMessage(safeText); };
+      console.log("▶️ Playing audio...");
+      await audio.play();
+    } catch (e) {
+      console.error("Error in speak():", e);
+      stopAudio();
+      setVisualState("idle");
+      setLastBotMessage(safeText);
     }
-  }, [videoState]);
+  };
+
+  const callManus = async (input: string, language: KickiLang) => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 60000);
+    try {
+      const resp = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: input, lang: language }),
+        signal: controller.signal,
+      });
+      const data = await resp.json().catch(() => ({} as any));
+      if (!resp.ok) {
+        const msg = data?.error?.message || (typeof data?.error === "string" ? data.error : null) || `Error /api/chat (${resp.status})`;
+        throw new Error(msg);
+      }
+      const reply = (typeof data?.reply === "string" && data.reply) || (typeof data?.text === "string" && data.text) || "";
+      return reply.trim();
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  };
+
+  const clearWsPing = () => {
+    if (wsPingTimerRef.current) { window.clearInterval(wsPingTimerRef.current); wsPingTimerRef.current = null; }
+  };
+
+  const stopWsListening = async () => {
+    clearWsPing();
+    try { processorRef.current?.disconnect(); } catch {}
+    try { if (audioCtxRef.current && audioCtxRef.current.state !== "closed") await audioCtxRef.current.close(); } catch {}
+    try { streamRef.current?.getTracks()?.forEach((t) => t.stop()); } catch {}
+    try { wsRef.current?.close(); } catch {}
+    processorRef.current = null;
+    audioCtxRef.current = null;
+    streamRef.current = null;
+    wsRef.current = null;
+    setIsListening(false);
+  };
+
+  const startWsListening = async () => {
+    setTranscript("");
+    setError(null);
+    stopAudio();
+    setVisualState("idle");
+
+    console.log("VOICE_WS_URL =>", VOICE_WS_URL);
+    const ws = new WebSocket(VOICE_WS_URL);
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    const startPing = () => {
+      clearWsPing();
+      wsPingTimerRef.current = window.setInterval(() => {
+        try { if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send("ping"); } catch {}
+      }, 15000);
+    };
+
+    ws.onopen = async () => {
+      console.log("✅ WebSocket connected");
+      startPing();
+      try { ws.send(JSON.stringify({ type: "barge_in" })); } catch {}
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioCtxRef.current = audioCtx;
+        const source = audioCtx.createMediaStreamSource(stream);
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+        processor.onaudioprocess = (e) => {
+          const currentWs = wsRef.current;
+          if (!currentWs || currentWs.readyState !== WebSocket.OPEN) return;
+         const input = e.inputBuffer.getChannelData(0);
+          // Amplificar 3x
+          const amplified = new Float32Array(input.length);
+          for (let i = 0; i < input.length; i++) {
+            amplified[i] = Math.max(-1, Math.min(1, input[i] * 2.0));
+          }
+          const ds = downsampleTo16k(amplified, audioCtx.sampleRate);
+          const pcm = floatTo16BitPCM(ds);
+          currentWs.send(pcm);
+        };
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+        setIsListening(true);
+        console.log("🎤 Microphone active");
+      } catch (err) {
+        console.error("❌ Microphone error:", err);
+        setError("No se pudo acceder al micrófono.");
+        await stopWsListening();
+      }
+    };
+
+    ws.onmessage = async (ev) => {
+      if (typeof ev.data !== "string") return;
+      let msg: any = null;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+
+      if (msg.type === "stt_partial") { setTranscript(msg.text || ""); return; }
+
+      if (msg.type === "stt_final") {
+        const finalText = (msg.text || "").trim();
+        if (!finalText) return;
+        setTranscript(finalText);
+        await stopWsListening();
+        setIsThinking(true);
+        try {
+          const reply = await callManus(finalText, lang);
+          const safeReply = reply || "No pude generar respuesta. ¿Puedes repetirlo de otra forma?";
+          console.log("📢 About to call speak() with:", safeReply);
+          await speak(safeReply);
+          console.log("📢 speak() completed");
+        } catch (e: any) {
+          console.error(e);
+          setError(e?.message || "Error hablando con Kicki.");
+          setLastBotMessage("Tuve un problema conectando. Inténtalo otra vez.");
+        } finally {
+          setIsThinking(false);
+          setTranscript("");
+        }
+        return;
+      }
+
+      if (msg.type === "error") { setError(msg.message || "Error del servidor de voz."); return; }
+    };
+
+    ws.onerror = () => {
+      setError(`Error de conexión de voz (WebSocket). URL=${VOICE_WS_URL}`);
+      stopWsListening().catch(() => {});
+    };
+
+    ws.onclose = () => {
+      console.log("🔌 WebSocket closed");
+      clearWsPing();
+      setIsListening(false);
+    };
+  };
+
+  const toggleListening = async () => {
+    userInteractedRef.current = true;
+    try {
+      if (isListening) { await stopWsListening(); }
+      else { await startWsListening(); }
+    } catch (e) {
+      console.error("Error toggling listening:", e);
+      setError("Error al activar el micrófono.");
+      setIsListening(false);
+    }
+  };
+
+  const toggleMute = () => {
+    userInteractedRef.current = true;
+    setIsMuted((m) => !m);
+    if (!isMuted) { stopAudio(); setVisualState("idle"); }
+  };
+
+  const assets: Record<KickiVisualState, string> = {
+    idle: "/assets/kicki_fullbody_idle.mp4",
+    speaking: "/assets/kicki_fullbody_talk.mp4",
+    empathy: "/assets/kicki_fullbody_empathy.mp4",
+  };
 
   return (
-    <div style={{
-      minHeight: "100vh",
-      background: "linear-gradient(135deg, #1e1b4b 0%, #581c87 50%, #1e1b4b 100%)",
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: "20px"
-    }}>
-      {/* Video */}
-      <div style={{
-        width: "320px",
-        height: "400px",
-        borderRadius: "24px",
-        overflow: "hidden",
-        boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
-        border: "4px solid rgba(168, 85, 247, 0.3)",
-        marginBottom: "30px",
-        position: "relative"
-      }}>
-        <video
-          ref={videoRef}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
-          loop
-          muted
-          playsInline
-          autoPlay
-        />
-        
-        {/* Status */}
-        <div style={{
-          position: "absolute",
-          top: "-8px",
-          right: "-8px",
-          width: "24px",
-          height: "24px",
-          borderRadius: "50%",
-          border: "4px solid #1e1b4b",
-          background: isListening ? "#ef4444" : isProcessing ? "#eab308" : "#22c55e",
-          animation: isListening || isProcessing ? "pulse 2s infinite" : "none"
-        }} />
-      </div>
-
-      {/* Button */}
-      <button
-        onClick={handleClick}
-        disabled={isProcessing}
-        style={{
-          width: "80px",
-          height: "80px",
-          borderRadius: "50%",
-          border: "none",
-          background: isListening ? "#ef4444" : "#a855f7",
-          boxShadow: `0 10px 30px ${isListening ? "rgba(239, 68, 68, 0.5)" : "rgba(168, 85, 247, 0.5)"}`,
-          cursor: isProcessing ? "not-allowed" : "pointer",
-          transition: "all 0.3s",
-          marginBottom: "30px",
-          opacity: isProcessing ? 0.5 : 1,
-          transform: "scale(1)"
-        }}
-        onMouseEnter={(e) => {
-          if (!isProcessing) e.currentTarget.style.transform = "scale(1.1)";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.transform = "scale(1)";
-        }}
-      >
-        <svg
-          style={{ width: "32px", height: "32px", color: "white" }}
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth={2}
-            d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+    <div className="fixed inset-0 z-50 bg-black flex flex-col items-center justify-center overflow-hidden">
+      <div className="absolute inset-0 z-0">
+        <AnimatePresence mode="wait">
+          <motion.video
+            key={visualState}
+            src={assets[visualState]}
+            autoPlay loop muted playsInline
+            initial={{ opacity: 0.8, scale: 1.05 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0.8 }}
+            transition={{ duration: 0.5 }}
+            className="w-full h-full object-cover opacity-90"
+            onError={() => console.error("Video load error")}
           />
-        </svg>
-      </button>
-
-      {/* Messages */}
-      <div style={{
-        width: "100%",
-        maxWidth: "600px",
-        background: "rgba(30, 27, 75, 0.5)",
-        backdropFilter: "blur(10px)",
-        borderRadius: "16px",
-        padding: "24px",
-        boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
-        maxHeight: "300px",
-        overflowY: "auto"
-      }}>
-        {messages.length === 0 ? (
-          <p style={{ textAlign: "center", color: "#9ca3af" }}>
-            Click the microphone to start...
-          </p>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-            {messages.map((msg, idx) => (
-              <div
-                key={idx}
-                style={{
-                  display: "flex",
-                  justifyContent: msg.role === "user" ? "flex-end" : "flex-start"
-                }}
-              >
-                <div style={{
-                  maxWidth: "80%",
-                  borderRadius: "16px",
-                  padding: "12px 16px",
-                  background: msg.role === "user" ? "#a855f7" : "#334155",
-                  color: "white"
-                }}>
-                  <p style={{ fontSize: "12px", fontWeight: "600", marginBottom: "4px" }}>
-                    {msg.role === "user" ? "You" : "Kicki"}
-                  </p>
-                  <p style={{ margin: 0 }}>{msg.content}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+        </AnimatePresence>
+        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20" />
       </div>
 
-      {isProcessing && (
-        <div style={{
-          marginTop: "16px",
-          color: "#d8b4fe",
-          display: "flex",
-          alignItems: "center",
-          gap: "8px"
-        }}>
-          <span>Kicki is thinking...</span>
+      <div className="absolute top-4 right-4 sm:top-6 sm:right-6 z-50 flex gap-2 sm:gap-4">
+        <div className="flex rounded-full bg-black/20 backdrop-blur-md border border-white/10 overflow-hidden">
+          <button type="button" onClick={() => setLang("es")} className={cn("px-3 py-2 text-xs sm:text-sm text-white/90 hover:bg-white/10", lang === "es" && "bg-white/15")}>ES</button>
+          <button type="button" onClick={() => setLang("en")} className={cn("px-3 py-2 text-xs sm:text-sm text-white/90 hover:bg-white/10", lang === "en" && "bg-white/15")}>EN</button>
         </div>
-      )}
+        <Button variant="ghost" size="icon" onClick={toggleMute} className="rounded-full bg-black/20 backdrop-blur-md border border-white/10 text-white hover:bg-white/20 w-10 h-10 sm:w-12 sm:h-12">
+          {isMuted ? <VolumeX className="w-5 h-5 sm:w-6 sm:h-6" /> : <Volume2 className="w-5 h-5 sm:w-6 sm:h-6" />}
+        </Button>
+        <Button variant="ghost" size="icon" onClick={() => { stopWsListening().catch(() => {}); stopAudio(); onClose(); }} className="rounded-full bg-black/20 backdrop-blur-md border border-white/10 text-white hover:bg-white/20 w-10 h-10 sm:w-12 sm:h-12">
+          <X className="w-5 h-5 sm:w-6 sm:h-6" />
+        </Button>
+      </div>
+
+      <div className="absolute bottom-0 left-0 right-0 p-4 sm:p-8 z-50 flex flex-col items-center gap-4 sm:gap-6">
+        {error && (
+          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex items-center gap-2 bg-red-500/20 border border-red-500/50 text-white px-4 py-2 rounded-lg text-sm">
+            <AlertCircle className="w-4 h-4" />{error}
+          </motion.div>
+        )}
+        <div className="w-full max-w-2xl text-center space-y-2 sm:space-y-4 min-h-[80px] sm:min-h-[120px] flex flex-col justify-end">
+          <motion.p key={lastBotMessage} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="text-lg sm:text-2xl md:text-3xl font-serif font-medium text-white drop-shadow-lg">
+            "{lastBotMessage}"
+          </motion.p>
+          {transcript && (
+            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-sm sm:text-lg text-white/70 italic">
+              Tú: {transcript}
+            </motion.p>
+          )}
+          {isThinking && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-center">
+              <div className="flex items-center gap-2 text-white/70 text-sm">
+                <Loader2 className="w-4 h-4 animate-spin" />Pensando...
+              </div>
+            </motion.div>
+          )}
+        </div>
+        <div className="relative">
+          {isListening && <span className="absolute inset-0 rounded-full bg-primary/50 animate-ping" />}
+          <Button size="lg" onClick={toggleListening} disabled={isThinking}
+            className={cn("relative w-16 h-16 sm:w-20 sm:h-20 rounded-full border-4 transition-all duration-300 shadow-2xl",
+              isListening ? "bg-red-500 border-red-300 hover:bg-red-600" : "bg-white/10 backdrop-blur-md border-white/50 hover:bg-white/20",
+              isThinking && "opacity-60 cursor-not-allowed")}>
+            {isListening ? <MicOff className="w-6 h-6 sm:w-8 sm:h-8 text-white" /> : <Mic className="w-6 h-6 sm:w-8 sm:h-8 text-white" />}
+          </Button>
+        </div>
+        <p className="text-white/50 text-xs sm:text-sm font-medium tracking-widest uppercase">
+          {isThinking ? "Procesando..." : isListening ? "Escuchando..." : "Pulsa para hablar"}
+        </p>
+      </div>
     </div>
   );
 }
-
-export default TalkingMode;
