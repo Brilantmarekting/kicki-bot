@@ -11,9 +11,7 @@ interface TalkingModeProps {
   onClose: () => void;
 }
 
-const VOICE_WS_URL =
-  ((import.meta as any).env?.VITE_VOICE_WS_URL as string | undefined) ||
-const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:3001/ws";
+const VOICE_WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:3001/ws";
 function downsampleTo16k(float32: Float32Array, inRate: number) {
   const outRate = 16000;
   if (inRate === outRate) return float32;
