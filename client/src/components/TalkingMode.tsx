@@ -80,7 +80,8 @@ export default function TalkingMode({ onClose }: TalkingModeProps) {
       setLastBotMessage(safeText);
       setError(null);
       console.log("🔊 Fetching TTS for:", safeText);
-      const resp = await fetch("/api/tts", {
+     const apiUrl = import.meta.env.VITE_API_URL || "";
+     const resp = await fetch(`${apiUrl}/api/chat`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: safeText, lang }),
