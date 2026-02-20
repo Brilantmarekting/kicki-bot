@@ -186,8 +186,7 @@ wss.on("connection", (ws) => {
     const key = process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error("Missing DEEPGRAM_API_KEY");
 
-    const url = "wss://api.deepgram.com/v1/listen?model=nova-2&detect_language=true&punctuate=true&interim_results=true&encoding=linear16&sample_rate=16000&endpointing=300&utterance_end_ms=1000";
-
+const url = "wss://api.deepgram.com/v1/listen?model=nova-2&language=es&punctuate=true&interim_results=true&encoding=linear16&sample_rate=16000&endpointing=300&utterance_end_ms=1000";
     dgWs = new WebSocket(url, { headers: { Authorization: `Token ${key}` } });
 
     dgWs.on("open", () => {
